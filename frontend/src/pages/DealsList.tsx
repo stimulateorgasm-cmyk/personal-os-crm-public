@@ -1,0 +1,541 @@
+import React, { useState, useMemo, useRef, useCallback, useEffect } from "react"
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
+import {
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
+} from "@/components/ui/table"
+import { Input } from "@/components/ui/input"
+import { Button } from "@/components/ui/button"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  ArrowUpDown, Search, Plus, ChevronLeft, ChevronRight,
+  RotateCcw, Trash2, CalendarDays, ExternalLink, ShoppingCart,
+} from "lucide-react"
+import { formatDate, getStatusStyle, cn } from "@/lib/utils"
+import { buildProductOptions } from "@/lib/products"
+import { authFetch, API } from "@/hooks/use-api"
+import { DealEditor } from "@/components/DealEditor"
+import { InlineSelect } from "@/components/InlineSelect"
+import { InlineEdit } from "@/components/InlineEdit"
+import { DateInput } from "@/components/DateInput"
+import type { Deal } from "@/hooks/use-api"
+
+const LIMIT = 50
+
+const STATUS_OPTIONS = [
+  { value: "Ожидает", label: "Ожидает", color: "#eab308" },
+  { value: "В процессе", label: "В процессе", color: "#6366f1" },
+  { value: "Оплачено", label: "Оплачено", color: "#22c55e" },
+  { value: "На паузе", label: "На паузе", color: "#a855f7" },
+  { value: "Возврат", label: "Возврат", color: "#ef4444" },
+]
+
+const CONTRACT_STATUS_OPTIONS = [
+  { value: "-", label: "-", color: "#71717a" },
+  { value: "есть", label: "есть", color: "#22c55e" },
+  { value: "отправила", label: "отправила", color: "#eab308" },
+  { value: "расторгнут", label: "расторгнут", color: "#ef4444" },
+]
+
+const CONTRACT_WITH_OPTIONS = [
+  { value: "", label: "-", color: "#71717a" },
+  { value: "Шумкин ФЛ", label: "Шумкин ФЛ", color: "#6366f1" },
+  { value: "ИП Горовцов", label: "ИП Горовцов", color: "#22c55e" },
+  { value: "ИП Карика", label: "ИП Карика", color: "#f97316" },
+]
+
+const ACT_OPTIONS = [
+  { value: "-", label: "-", color: "#71717a" },
+  { value: "отправила", label: "отправила", color: "#eab308" },
+  { value: "есть", label: "есть", color: "#22c55e" },
+]
+
+interface DealsListProps { onSelect: (clientId: number) => void; highlightDealId?: number | null; onDealHighlighted?: () => void }
+
+export function DealsList({ onSelect, highlightDealId, onDealHighlighted }: DealsListProps) {
+  const queryClient = useQueryClient()
+  const [editingDeal, setEditingDeal] = useState<number | null>(null)
+  const [offset, setOffset] = useState(0)
+  const [search, setSearch] = useState("")
+  const [productFilter, setProductFilter] = useState("")
+  const [sortKey, setSortKey] = useState<string | null>("contract_date")
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc")
+  const [showNewDeal, setShowNewDeal] = useState(false)
+  const [dateFrom, setDateFrom] = useState(() => new URLSearchParams(window.location.search).get("date_from") || "")
+  const [dateTo, setDateTo] = useState(() => new URLSearchParams(window.location.search).get("date_to") || "")
+  const [showArchived, setShowArchived] = useState(() => new URLSearchParams(window.location.search).get("archived") === "true")
+  const [debtOnly, setDebtOnly] = useState(() => new URLSearchParams(window.location.search).get("debt") === "true")
+  const [amountMin, setAmountMin] = useState("")
+  const [amountMax, setAmountMax] = useState("")
+  const [appliedAmountMin, setAppliedAmountMin] = useState("")
+  const [appliedAmountMax, setAppliedAmountMax] = useState("")
+
+  const amountTimer = useRef<ReturnType<typeof setTimeout>>()
+  const applyAmountFilter = useCallback(() => {
+    setAppliedAmountMin(amountMin)
+    setAppliedAmountMax(amountMax)
+    setOffset(0)
+  }, [amountMin, amountMax])
+  const handleAmountChange = useCallback((type: "min" | "max", value: string) => {
+    if (type === "min") setAmountMin(value)
+    else setAmountMax(value)
+    clearTimeout(amountTimer.current)
+    amountTimer.current = setTimeout(applyAmountFilter, 300)
+  }, [applyAmountFilter])
+
+  useEffect(() => {
+    const p = new URLSearchParams()
+    if (dateFrom) p.set("date_from", dateFrom)
+    if (dateTo) p.set("date_to", dateTo)
+    if (debtOnly) p.set("debt", "true")
+    if (showArchived) p.set("archived", "true")
+    const qs = p.toString()
+    const url = qs ? `${window.location.pathname}?${qs}` : window.location.pathname
+    window.history.replaceState(null, "", url)
+  }, [dateFrom, dateTo, debtOnly, showArchived])
+
+  // Scroll to highlighted deal — retry until element appears in DOM
+  const highlightTimer = useRef<ReturnType<typeof setTimeout>>()
+  useEffect(() => {
+    if (highlightDealId === null) return
+    // Try finding the element every 200ms until it exists or 5s passes
+    let attempts = 0
+    const maxAttempts = 25
+    const tryScroll = () => {
+      const el = document.querySelector(`[data-deal-id="${highlightDealId}"]`)
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" })
+        highlightTimer.current = setTimeout(() => onDealHighlighted?.(), 3000)
+      } else if (++attempts < maxAttempts) {
+        highlightTimer.current = setTimeout(tryScroll, 200)
+      } else {
+        // Give up after 5s — still call callback so it doesn't hang forever
+        onDealHighlighted?.()
+      }
+    }
+    tryScroll()
+    return () => { clearTimeout(highlightTimer.current) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightDealId])
+
+  const queryParams = useMemo(() => {
+    const p = new URLSearchParams()
+    p.set("limit", String(LIMIT))
+    p.set("offset", String(offset))
+    p.set("archived", showArchived ? "true" : "false")
+    if (dateFrom) p.set("date_from", dateFrom)
+    if (dateTo) p.set("date_to", dateTo)
+    if (appliedAmountMin) p.set("amount_min", appliedAmountMin)
+    if (appliedAmountMax) p.set("amount_max", appliedAmountMax)
+    if (debtOnly) p.set("debt_only", "true")
+    if (search) p.set("search", search)
+    if (productFilter) p.set("product", productFilter)
+    return p.toString()
+  }, [offset, dateFrom, dateTo, appliedAmountMin, appliedAmountMax, debtOnly, search, productFilter])
+
+  const { data, isLoading } = useQuery({
+    queryKey: ["deals", queryParams],
+    queryFn: () => authFetch(`${API}/api/deals?${queryParams}`).then((r) => r.json()),
+  })
+
+  // Динамический список продуктов из БД (distinct) + seed
+  const { data: productsData } = useQuery({
+    queryKey: ["deal-products"],
+    queryFn: () => authFetch(`${API}/api/deals/products`).then((r) => r.json()),
+  })
+  const productOptions = useMemo(
+    () => buildProductOptions(Array.isArray(productsData?.products) ? productsData.products : []),
+    [productsData]
+  )
+
+  const resetFilters = useCallback(() => {
+    setDateFrom(""); setDateTo(""); setAmountMin(""); setAmountMax("")
+    setAppliedAmountMin(""); setAppliedAmountMax(""); setProductFilter(""); setOffset(0)
+  }, [])
+
+  const deleteDeal = useMutation({
+    mutationFn: (id: number) =>
+      authFetch(`${API}/api/deals/${id}`, { method: "DELETE" }).then((r) => r.json()),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["deals"] }) },
+  })
+
+  const patchDeal = useMutation({
+    mutationFn: ({ id, body }: { id: number; body: Record<string, any> }) =>
+      authFetch(`${API}/api/deals/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json()),
+    onSuccess: (_data: any, variables: { id: number; body: Record<string, any> }) => {
+      // Мгновенно обновляем все кешированные списки сделок
+      queryClient.setQueriesData({ queryKey: ["deals"] }, (old: any) => {
+        if (!old?.deals) return old
+        return {
+          ...old,
+          deals: old.deals.map((d: any) =>
+            d.id === variables.id ? { ...d, ...variables.body } : d
+          ),
+        }
+      })
+      queryClient.invalidateQueries({ queryKey: ["deals"] })
+    },
+  })
+
+  // Правка клиента (имя / ник) — живут в таблице clients, приходят в сделки через JOIN
+  const patchClient = useMutation({
+    mutationFn: ({ id, body }: { id: number; body: Record<string, any> }) =>
+      authFetch(`${API}/api/clients/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json()),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["deals"] })
+      queryClient.invalidateQueries({ queryKey: ["clients"] })
+    },
+  })
+
+  const deals: Deal[] = Array.isArray(data?.deals) ? data.deals : []
+  const total = typeof data?.total === "number" ? data.total : 0
+  const pages = Math.ceil(Math.max(0, total) / LIMIT) || 1
+  const currentPage = Math.floor(offset / LIMIT) + 1
+
+  const filtered = useMemo(() => {
+    let result = deals
+    if (debtOnly) result = result.filter((d) => (d.amount || 0) - (d.paid || 0) > 0)
+    return result
+  }, [deals, debtOnly])
+
+  const sorted = useMemo(() => {
+    if (!sortKey) return filtered
+    return [...filtered].sort((a, b) => {
+      const aVal = (a as any)[sortKey]
+      const bVal = (b as any)[sortKey]
+      if (typeof aVal === "number" && typeof bVal === "number") return sortDir === "asc" ? aVal - bVal : bVal - aVal
+      const cmp = String(aVal || "").localeCompare(String(bVal || ""))
+      return sortDir === "asc" ? cmp : -cmp
+    })
+  }, [filtered, sortKey, sortDir])
+
+  const toggleSort = (col: string) => {
+    if (sortKey === col) setSortDir((d) => (d === "asc" ? "desc" : "asc"))
+    else { setSortKey(col); setSortDir("desc") }
+  }
+
+  const SortHeader = ({ col, label, narrow }: { col: string; label: string; narrow?: boolean }) => (
+    <TableHead className={`cursor-pointer select-none whitespace-nowrap ${narrow ? "w-0" : ""}`} onClick={() => toggleSort(col)}>
+      <div className="flex items-center gap-1">
+        <span className="text-[10px] uppercase tracking-wider">{label}</span>
+        <ArrowUpDown size={10} className={cn("text-zinc-600", sortKey === col && "text-white")} />
+      </div>
+    </TableHead>
+  )
+
+  return (
+    <div>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-xl font-semibold text-white">Сделки</h1>
+          <p className="text-sm text-zinc-500 mt-1">{total.toLocaleString()} сделок</p>
+        </div>
+        <Button size="sm" className="gap-2" onClick={() => setShowNewDeal(true)}><Plus size={14} />Новая сделка</Button>
+      </div>
+
+      {/* Search + Product filter */}
+      <div className="flex items-center gap-3 mb-4">
+        <div className="relative max-w-sm flex-1">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-500" />
+          <Input placeholder="Поиск по продукту, клиенту, №..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9 h-9 text-sm bg-zinc-900 border-zinc-800" />
+        </div>
+        <select
+          value={productFilter}
+          onChange={(e) => { setProductFilter(e.target.value); setOffset(0) }}
+          className="h-9 px-3 text-xs rounded-md bg-zinc-900 border border-zinc-800 text-zinc-300 outline-none focus:border-zinc-600 appearance-none cursor-pointer"
+        >
+          <option value="">Все продукты</option>
+          {productOptions.map((p) => (
+            <option key={p.value} value={p.value}>{p.label}</option>
+          ))}
+        </select>
+        {productFilter && (
+          <button
+            onClick={() => { setProductFilter(""); setOffset(0) }}
+            className="flex items-center gap-1 h-7 px-2 text-xs text-zinc-500 hover:text-white rounded hover:bg-zinc-800 transition-colors whitespace-nowrap"
+          >
+            <RotateCcw size={12} />Сброс продукта
+          </button>
+        )}
+      </div>
+
+      {/* Filters */}
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <div className="flex items-center gap-1.5">
+          <label className="text-[10px] text-zinc-500 uppercase tracking-wider">Дата договора</label>
+          <DateFilterButton value={dateFrom} onChange={(v) => { setDateFrom(v); setOffset(0) }} placeholder="от" />
+          <span className="text-xs text-zinc-500">—</span>
+          <DateFilterButton value={dateTo} onChange={(v) => { setDateTo(v); setOffset(0) }} placeholder="до" />
+        </div>
+        <div className="flex items-center gap-1.5">
+          <label className="text-[10px] text-zinc-500 uppercase tracking-wider">Сумма</label>
+          <input type="number" placeholder="от" value={amountMin} onChange={(e) => handleAmountChange("min", e.target.value)} className="h-7 w-20 px-2 text-xs rounded bg-zinc-900 border border-zinc-800 text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-zinc-600" />
+          <span className="text-xs text-zinc-500">—</span>
+          <input type="number" placeholder="до" value={amountMax} onChange={(e) => handleAmountChange("max", e.target.value)} className="h-7 w-20 px-2 text-xs rounded bg-zinc-900 border border-zinc-800 text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-zinc-600" />
+          <span className="text-xs text-zinc-500">₽</span>
+        </div>
+        <button onClick={() => setShowArchived(!showArchived)} className={cn("flex items-center gap-1 h-7 px-2 text-xs rounded transition-colors", showArchived ? "bg-zinc-800 text-zinc-300" : "text-zinc-500 hover:text-white")}>📦 Архив</button>
+        <button onClick={() => setDebtOnly(!debtOnly)} className={cn("flex items-center gap-1 h-7 px-2 text-xs rounded transition-colors min-h-[28px] touch-manipulation", debtOnly ? "bg-orange-900/30 text-orange-400 border border-orange-800/50" : "text-zinc-500 hover:text-white")}>💰 Только с долгом</button>
+        {(dateFrom || dateTo || appliedAmountMin || appliedAmountMax) && (
+          <button onClick={resetFilters} className="flex items-center gap-1 h-7 px-2 text-xs text-zinc-500 hover:text-white rounded hover:bg-zinc-800 transition-colors"><RotateCcw size={12} />Сброс</button>
+        )}
+      </div>
+
+      {/* Table */}
+      <div className="rounded-lg border border-zinc-800 overflow-x-auto">
+        <Table className="min-w-[1400px] lg:min-w-full">
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-0 sticky left-0 bg-zinc-950 z-10" />
+              <SortHeader col="reg_number" label="№" narrow />
+              <SortHeader col="product" label="Продукт" />
+              <SortHeader col="client_name" label="ФИО" />
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Ник тг</span></TableHead>
+              <SortHeader col="status" label="Статус" />
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">В / П / О</span></TableHead>
+              <SortHeader col="amount" label="Сумма" />
+              <SortHeader col="paid" label="Оплачено" />
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Остаток</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Договор</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">С кем</span></TableHead>
+              <SortHeader col="contract_date" label="Дата дог." />
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Акт</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">% ассист.</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Выпл. ассист.</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Ист./Реф.</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">% рефа</span></TableHead>
+              <TableHead className="whitespace-nowrap"><span className="text-[10px] uppercase tracking-wider">Выпл. рефу</span></TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {isLoading && Array.from({ length: 8 }).map((_, i) => (
+              <TableRow key={i}>
+                {Array.from({ length: 18 }).map((_, j) => (
+                  <TableCell key={j}><Skeleton className="h-4 w-16" /></TableCell>
+                ))}
+              </TableRow>
+            ))}
+            {!isLoading && sorted.map((d: Deal) => {
+              const remainder = (d.amount || 0) - (d.paid || 0)
+              return (
+                <DealRow
+                  key={d.id}
+                  deal={d}
+                  remainder={remainder}
+                  onSelect={onSelect}
+                  onDelete={(id) => { if (confirm("Удалить сделку?")) deleteDeal.mutate(id) }}
+                  onOpenSheet={(id) => setEditingDeal(id)}
+                  patchDeal={patchDeal}
+                  patchClient={patchClient}
+                  productOptions={productOptions}
+                  highlighted={highlightDealId === d.id}
+                />
+              )
+            })}
+            {!isLoading && sorted.length === 0 && (
+              <TableRow><TableCell colSpan={19} className="text-center py-12 text-zinc-500">Нет сделок</TableCell></TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </div>
+
+      {/* Pagination */}
+      {pages > 1 && (
+        <div className="flex items-center justify-between mt-4 text-sm text-zinc-500">
+          <span>{total} сделок</span>
+          <div className="flex items-center gap-2">
+            <button className="p-1 rounded hover:bg-zinc-800 disabled:opacity-30" disabled={currentPage <= 1} onClick={() => setOffset((currentPage - 2) * LIMIT)}><ChevronLeft size={16} /></button>
+            <span className="text-xs">{currentPage} / {pages}</span>
+            <button className="p-1 rounded hover:bg-zinc-800 disabled:opacity-30" disabled={currentPage >= pages} onClick={() => setOffset(currentPage * LIMIT)}><ChevronRight size={16} /></button>
+          </div>
+        </div>
+      )}
+
+      {editingDeal !== null && <DealEditor key={editingDeal} dealId={editingDeal} onClose={() => setEditingDeal(null)} onSelectClient={onSelect} />}
+      {showNewDeal && <DealEditor key="create" createMode dealId={null} onClose={() => setShowNewDeal(false)} />}
+    </div>
+  )
+}
+
+// ─── Deal Row ──────────────────────────────────────────────────────────────────
+function DealRow({ deal, remainder, onSelect, onDelete, onOpenSheet, patchDeal, patchClient, productOptions, highlighted }: {
+  deal: Deal; remainder: number
+  onSelect: (id: number) => void; onDelete: (id: number) => void; onOpenSheet: (id: number) => void
+  patchDeal: any; patchClient: any; productOptions: { value: string; label: string; color: string }[]; highlighted?: boolean
+}) {
+  const handlePatch = (body: Record<string, any>) => patchDeal.mutate({ id: deal.id, body })
+  const handlePatchClient = (body: Record<string, any>) => {
+    if (!deal.client_id) return
+    patchClient.mutate({ id: deal.client_id, body })
+  }
+
+  return (
+    <TableRow data-deal-id={deal.id} className={`hover:bg-zinc-800/50 group transition-colors duration-1000 ${highlighted ? "bg-emerald-900/40" : ""}`}>
+      {/* 0 — open button */}
+      <TableCell className="sticky left-0 bg-zinc-950 group-hover:bg-zinc-800/50 z-10 w-0">
+        <button onClick={() => onOpenSheet(deal.id)}
+          className="min-h-[36px] min-w-[36px] flex items-center justify-center text-zinc-600 hover:text-white transition-colors touch-manipulation">
+          <ExternalLink size={14} />
+        </button>
+      </TableCell>
+      {/* 1 — № */}
+      <TableCell>
+        <InlineEdit value={deal.reg_number || ""} onSave={(v) => handlePatch({ reg_number: v })} placeholder="" className="text-xs w-16" />
+      </TableCell>
+      {/* 2 — Продукт */}
+      <TableCell>
+        <InlineSelect value={deal.product || ""} options={productOptions} onSelect={(v) => handlePatch({ product: v })} placeholder="—" />
+      </TableCell>
+      {/* 3 — ФИО: клик — правка имени, стрелка — карточка клиента */}
+      <TableCell className="max-w-[200px] whitespace-nowrap overflow-hidden text-ellipsis">
+        <div className="flex items-center gap-1">
+          <InlineEdit value={deal.client_name || ""} onSave={(v) => handlePatchClient({ name: v })} placeholder="—" className="text-sm font-medium truncate max-w-[150px]" />
+          {deal.client_id && (
+            <button onClick={(e) => { e.stopPropagation(); onSelect(deal.client_id) }}
+              className="shrink-0 opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-blue-400 transition-all min-h-[28px] min-w-[28px] flex items-center justify-center touch-manipulation"
+              title="Открыть карточку клиента">
+              <ExternalLink size={14} />
+            </button>
+          )}
+        </div>
+      </TableCell>
+      {/* 4 — Ник тг: ссылка + правка */}
+      <TableCell className="text-xs whitespace-nowrap">
+        <InlineEdit value={deal.telegram_nick || ""} onSave={(v) => handlePatchClient({ telegram_nick: v })} placeholder="—" linkify />
+      </TableCell>
+      {/* 5 — Статус */}
+      <TableCell>
+        <InlineSelect value={deal.status} options={STATUS_OPTIONS} onSelect={(v) => handlePatch({ status: v })} />
+      </TableCell>
+      {/* 6 — Сессии: всего / проведено / осталось */}
+      <TableCell className="text-xs whitespace-nowrap text-center">
+        <span className="inline-flex items-center gap-0.5 text-[11px]">
+          <InlineEdit value={String(deal.sessions_total || 0)} onSave={(v) => handlePatch({ sessions_total: parseInt(v) || 0 })} type="number" placeholder="0" className="w-10 text-right" />
+          <span className="text-zinc-600">/</span>
+          <InlineEdit value={String(deal.sessions_conducted || 0)} onSave={(v) => handlePatch({ sessions_conducted: parseInt(v) || 0 })} type="number" placeholder="0" className="w-10 text-right" />
+          <span className="text-zinc-600">/</span>
+          <span className={cn("w-8 text-right tabular-nums", (deal.sessions_total - deal.sessions_conducted) > 0 ? "text-blue-400" : "text-zinc-500")}>
+            {Math.max(0, (deal.sessions_total || 0) - (deal.sessions_conducted || 0))}
+          </span>
+        </span>
+      </TableCell>
+      {/* 7 — Сумма */}
+      <TableCell className="font-medium whitespace-nowrap">
+        <InlineEdit value={String(deal.amount || 0)} onSave={(v) => handlePatch({ amount: parseFloat(v) || 0 })} type="number" placeholder="0" className="w-20 text-right font-medium" /><span className="ml-1 text-xs text-zinc-600">₽</span>
+      </TableCell>
+      {/* 8 — Оплачено — read-only если есть платежи */}
+      <TableCell className="whitespace-nowrap">
+        {deal.payment_info && deal.payment_info !== "[]" ? (
+          <span className="text-sm text-zinc-300 text-right w-full inline-block">{(deal.paid || 0).toLocaleString()} ₽</span>
+        ) : (
+          <><InlineEdit value={String(deal.paid || 0)} onSave={(v) => handlePatch({ paid: parseFloat(v) || 0 })} type="number" placeholder="0" className="w-20 text-right" /><span className="ml-1 text-xs text-zinc-600">₽</span></>
+        )}
+      </TableCell>
+      {/* 9 — Остаток */}
+      <TableCell className={`whitespace-nowrap font-medium ${remainder > 0 ? "text-orange-400" : "text-zinc-600"}`}>
+        {remainder.toLocaleString()} ₽
+      </TableCell>
+      {/* 10 — Договор */}
+      <TableCell>
+        <InlineSelect value={deal.contract_status || "-"} options={CONTRACT_STATUS_OPTIONS} onSelect={(v) => handlePatch({ contract_status: v })} />
+      </TableCell>
+      {/* 11 — С кем договор */}
+      <TableCell>
+        <InlineSelect value={deal.contract_with || ""} options={CONTRACT_WITH_OPTIONS} onSelect={(v) => handlePatch({ contract_with: v })} />
+      </TableCell>
+      {/* 12 — Дата договора */}
+      <TableCell>
+        <DateInput value={deal.contract_date || ""} onChange={(iso) => handlePatch({ contract_date: iso })} placeholder="ДД.ММ.ГГГГ" className="w-28" />
+      </TableCell>
+      {/* 13 — Акт */}
+      <TableCell>
+        <InlineSelect value={deal.act_status || "-"} options={ACT_OPTIONS} onSelect={(v) => handlePatch({ act_status: v })} />
+      </TableCell>
+      {/* 14 — % ассистента */}
+      <TableCell>
+        <InlineEdit value={deal.assistant_pct || ""} onSave={(v) => handlePatch({ assistant_pct: v })} placeholder="" className="w-14" />
+      </TableCell>
+      {/* 15 — Выплачено ассистенту */}
+      <TableCell>
+        <InlineEdit value={deal.assistant_paid || ""} onSave={(v) => handlePatch({ assistant_paid: v })} placeholder="" className="w-16" />
+      </TableCell>
+      {/* 16 — Источник/Реферал */}
+      <TableCell>
+        <InlineEdit value={deal.source || ""} onSave={(v) => handlePatch({ source: v })} placeholder="" className="w-24" />
+      </TableCell>
+      {/* 17 — % рефа */}
+      <TableCell>
+        <InlineEdit value={deal.referral_pct || ""} onSave={(v) => handlePatch({ referral_pct: v })} placeholder="" className="w-14" />
+      </TableCell>
+      {/* 18 — Выплачено рефу */}
+      <TableCell>
+        <div className="flex items-center gap-1">
+          <InlineEdit value={deal.referral_paid || ""} onSave={(v) => handlePatch({ referral_paid: v })} placeholder="" className="w-16" />
+          <button onClick={() => onDelete(deal.id)}
+            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 transition-all min-h-[28px] min-w-[28px] flex items-center justify-center touch-manipulation" title="Удалить">
+            <Trash2 size={12} />
+          </button>
+        </div>
+      </TableCell>
+    </TableRow>
+  )
+}
+
+// ─── Calendar grid for date filter ──────────────────────────────────────────────
+const MONTHS_RU = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
+
+function CalendarGrid({ onSelect, onClose }: { onSelect: (d: string) => void; onClose: () => void }) {
+  const now = new Date()
+  const [year, setYear] = useState(now.getFullYear())
+  const [month, setMonth] = useState(now.getMonth())
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  const firstDay = new Date(year, month, 1).getDay()
+  const startOffset = Math.max(0, firstDay === 0 ? 6 : firstDay - 1)
+  const todayStr = now.toDateString()
+  const days: (number | null)[] = Array(Math.max(1, startOffset)).fill(null)
+  for (let d = 1; d <= daysInMonth; d++) days.push(d)
+
+  return (
+    <div className="p-3 rounded-xl bg-zinc-900 border border-zinc-700/50 shadow-2xl w-64">
+      <div className="flex items-center justify-between mb-3">
+        <button onClick={() => { const d = new Date(year, month - 1, 1); setYear(d.getFullYear()); setMonth(d.getMonth()) }}
+          className="w-8 h-8 flex items-center justify-center rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors text-sm">◀</button>
+        <span className="text-sm font-semibold text-zinc-200">{MONTHS_RU[month]} {year}</span>
+        <button onClick={() => { const d = new Date(year, month + 1, 1); setYear(d.getFullYear()); setMonth(d.getMonth()) }}
+          className="w-8 h-8 flex items-center justify-center rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors text-sm">▶</button>
+      </div>
+      <div className="grid grid-cols-7 gap-0.5 mb-1.5">
+        {["пн","вт","ср","чт","пт","сб","вс"].map(wd => <div key={wd} className="text-center text-[11px] font-medium text-zinc-600 py-1">{wd}</div>)}
+      </div>
+      <div className="grid grid-cols-7 gap-0.5">
+        {days.map((d, i) =>
+          d === null ? <div key={`e-${i}`} /> : (
+            <button key={d} onClick={() => { onSelect(`${year}-${String(month+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`); onClose() }}
+              className={cn("w-full aspect-square flex items-center justify-center text-sm rounded-lg transition-colors",
+                new Date(year, month, d).toDateString() === todayStr ? "bg-yellow-600 text-white font-bold" : "text-zinc-300 hover:bg-zinc-800 hover:text-white")}>{d}</button>
+          )
+        )}
+      </div>
+      <button onClick={onClose} className="w-full text-center text-xs text-zinc-600 hover:text-zinc-400 mt-3 py-1.5 rounded-lg hover:bg-zinc-800/50 transition-colors">Закрыть</button>
+    </div>
+  )
+}
+
+function DateFilterButton({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder: string }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    document.addEventListener("mousedown", handler)
+    return () => document.removeEventListener("mousedown", handler)
+  }, [])
+  return (
+    <div className="relative" ref={ref}>
+      <button onClick={() => setOpen(!open)}
+        className={cn("flex items-center gap-1 h-7 px-2 text-xs rounded transition-colors", value ? "bg-zinc-800 text-zinc-300" : "bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-300")}>
+        <CalendarDays size={11} />{value || placeholder}{value && <span className="ml-1 text-zinc-600" onClick={(e) => { e.stopPropagation(); onChange("") }}>✕</span>}
+      </button>
+      {open && <div className="absolute top-full mt-1 left-0 z-50"><CalendarGrid onSelect={onChange} onClose={() => setOpen(false)} /></div>}
+    </div>
+  )
+}
